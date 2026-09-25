@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .planner import Plan, PlanningError, plan_pages
+from .practice_route import PracticeRouteError, plan_practice_route
 from .practice_tabs import PracticeTabError, plan_practice_tabs
 from .print_audit import PrintAuditError, audit_print_pages
 from .rehearsal import (
@@ -596,6 +597,80 @@ class PracticeTabsResponse(BaseModel):
     )
 
 
+# ---------------------------------------- 已保存方案的练习路线
+
+
+class PracticeRouteRequest(BaseModel):
+    """练习路线规划请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    practice_measures: List[int] = Field(
+        ..., description="常练小节序号列表（原谱 0 基、互异，1~15 个）"
+    )
+    start_page: int = Field(..., description="起始页码（1 基）")
+    dependencies: List[Tuple[int, int]] = Field(
+        default_factory=list,
+        description="先后依赖二元组 [先练, 后练]（均为小节序号，两端都必须是"
+        "常练小节）；省略或为空表示无依赖",
+    )
+
+    @field_validator("practice_measures", mode="before")
+    @classmethod
+    def _reject_non_integer_measures(cls, value: object) -> object:
+        """小节序号必须是严格整数：拒绝 1.5 之类浮点（pydantic 默认会强转）
+        与布尔；越界/重复/个数等语义由核心逻辑统一报中文错误。"""
+        if isinstance(value, list):
+            for m in value:
+                if not isinstance(m, int) or isinstance(m, bool):
+                    raise ValueError(f"小节序号必须为整数（收到 {m!r}）")
+        return value
+
+    @field_validator("start_page", mode="before")
+    @classmethod
+    def _reject_non_integer_start_page(cls, value: object) -> object:
+        """起始页码必须是严格整数：拒绝浮点与布尔；范围由核心逻辑校验。"""
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"起始页码必须为整数（收到 {value!r}）")
+        return value
+
+    @field_validator("dependencies", mode="before")
+    @classmethod
+    def _reject_non_integer_dependencies(cls, value: object) -> object:
+        """依赖必须是严格整数小节序号的二元组：拒绝浮点、布尔与长度非 2。"""
+        if isinstance(value, list):
+            for pair in value:
+                if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                    raise ValueError(
+                        f"依赖必须是小节序号二元组（收到 {pair!r}）"
+                    )
+                for endpoint in pair:
+                    if not isinstance(endpoint, int) or isinstance(endpoint, bool):
+                        raise ValueError(
+                            f"依赖的小节序号必须为整数（收到 {endpoint!r}）"
+                        )
+        return value
+
+
+class PracticeRouteResponse(BaseModel):
+    id: str
+    request: PracticeRouteRequest
+    page_count: int = Field(..., description="已存方案的规划页数")
+    order: List[int] = Field(
+        ..., description="满足全部依赖的练习顺序（原谱 0 基小节序号）"
+    )
+    order_pages: List[int] = Field(
+        ..., description="练习顺序中各小节所在页码（1 基，与 order 一一对应）"
+    )
+    segment_distances: List[int] = Field(
+        ..., description="各段翻页距离：起始页到首项，及相邻项之间的页码距离"
+        "（长度与 order 一致）"
+    )
+    total_distance: int = Field(
+        ..., description="总翻页距离（各段距离之和，全局最小）"
+    )
+
+
 # ---------------------------------------------------------------- 接口
 
 
@@ -880,6 +955,52 @@ def plan_practice_tabs_for_plan(
             )
             for t in result.targets
         ],
+    )
+
+
+@app.post(
+    "/api/v1/plans/{plan_id}/practice-route",
+    response_model=PracticeRouteResponse,
+)
+def plan_practice_route_for_plan(
+    plan_id: str, payload: PracticeRouteRequest
+) -> PracticeRouteResponse:
+    """为已保存方案规划练习路线。
+
+    按方案把 1~15 个互异的常练小节映射到所在页，在满足全部先后依赖（二元组
+    [先练, 后练]）的前提下排出练习顺序，使"起始页到首项及相邻项之间的页码
+    距离之和"最小；同成本取小节序号序列字典序最小者，返回顺序、各段翻页
+    距离与总距离。
+    """
+    assert store is not None
+    record = store.get(plan_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"规划结果不存在：{plan_id}")
+
+    plan_request = PlanRequest(**record["request"])
+    plan_result = PlanResult(**record["result"])
+    page_starts = [p.start_measure for p in plan_result.pages]
+
+    try:
+        result = plan_practice_route(
+            page_starts=page_starts,
+            measure_count=len(plan_request.measure_heights),
+            measures=payload.practice_measures,
+            start_page=payload.start_page,
+            dependencies=[(a, b) for a, b in payload.dependencies],
+        )
+    except PracticeRouteError as exc:
+        # 空目标 / 小节或页码越界 / 重复小节 / 依赖指向非目标小节 / 依赖成环
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return PracticeRouteResponse(
+        id=record["id"],
+        request=payload,
+        page_count=plan_result.page_count,
+        order=result.order,
+        order_pages=result.order_pages,
+        segment_distances=result.segment_distances,
+        total_distance=result.total_distance,
     )
 
 
